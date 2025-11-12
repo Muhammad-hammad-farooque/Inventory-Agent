@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import List, Dict
 
 from fastapi import FastAPI, Depends
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -22,10 +23,17 @@ from schema import (
 
 
 load_dotenv()
-gemini.api_key = os.getenv("GEMINI_API_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 
-app = FastAPI(title="Inventory + Finance Agents")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_db_and_tables()
+    seed_initial_data()
+    yield
+    print("Application shutting down...")
+
+app = FastAPI(title="Inventory + Finance Agents", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,11 +41,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-def startup_event():
-    create_db_and_tables()
-    seed_initial_data()
 
 
 def get_low_stock_items(session: Session):
