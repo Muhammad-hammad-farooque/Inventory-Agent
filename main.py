@@ -1,16 +1,18 @@
 import os
+import asyncio
 import json
 from datetime import datetime
-from typing import List, Dict
-
+from typing import List
+from agents import Agent, ItemHelpers, function_tool,Runner,set_default_openai_client,set_tracing_export_api_key,set_default_openai_api,ModelSettings
+from openai import AsyncOpenAI
+from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 from fastapi import FastAPI, Depends
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Session, select
 from dotenv import load_dotenv
-import openai
-
+from fastapi.responses import StreamingResponse
 from schema import (
     InventoryItem,
     Reorder,
@@ -20,10 +22,16 @@ from schema import (
     get_session,
     seed_initial_data,
 )
-
-
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+BASE_URL = os.getenv("BASE_URL")
+API_KEY = os.getenv("API_KEY")
+Trace_key = os.getenv("TRACING_API_KEY")
+
+client = AsyncOpenAI(base_url = BASE_URL, api_key = API_KEY )
+set_default_openai_client(client,use_for_tracing=False)
+set_tracing_export_api_key(Trace_key)
+# set_default_openai_api("chat_completions",)
 
 
 @asynccontextmanager
@@ -43,138 +51,333 @@ app.add_middleware(
 )
 
 
-def get_low_stock_items(session: Session):
-    items = session.exec(select(InventoryItem)).all()
-    return [
-        {"id": i.id, "name": i.name, "quantity": i.quantity, "reorder_level": i.reorder_level}
-        for i in items if i.quantity < i.reorder_level
-    ]
+class CreateReorderInput(BaseModel):
+    item_id: int
+    quantity: int
+    requested_by: str = "Inventory_agent"
 
-def create_reorder(session: Session, item_id: int, quantity: int, requested_by="agent"):
-    item = session.get(InventoryItem, item_id)
-    if not item:
-        return {"error": "Item not found"}
+class ApproveReorderInput(BaseModel):
+    reorder_id: int
+    approve: bool
+    approver: str = "finance_agent"
 
-    total_cost = quantity * item.price_per_unit
-    reorder = Reorder(item_id=item_id, quantity_requested=quantity, unit_price=item.price_per_unit, total_cost=total_cost, requested_by=requested_by)
-    session.add(reorder)
-    session.commit()
-    session.refresh(reorder)
-    return {"message": "Reorder created", "reorder": reorder}
+class CreatePaymentInput(BaseModel):
+    reorder_id: int
 
-def approve_reorder(session: Session, reorder_id: int, approve: bool, approver="finance_agent"):
-    reorder = session.get(Reorder, reorder_id)
-    if not reorder:
-        return {"error": "Reorder not found"}
-
-    if approve:
-        reorder.status = "approved"
-        reorder.approved_by = approver
-        reorder.approved_at = datetime.utcnow()
-    else:
-        reorder.status = "rejected"
-
-    session.add(reorder)
-    session.commit()
-    return {"message": f"Reorder {reorder.status}"}
-
-def create_payment(session: Session, reorder_id: int):
-    reorder = session.get(Reorder, reorder_id)
-    if not reorder or reorder.status != "approved":
-        return {"error": "Reorder must be approved first"}
-
-    payment = Payment(reorder_id=reorder_id, amount=reorder.total_cost, status="paid", paid_at=datetime.utcnow())
-    session.add(payment)
-
-    budget = session.exec(select(Budget).limit(1)).first()
-    if budget:
-        budget.spent_amount += reorder.total_cost
-        session.add(budget)
-
-    reorder.status = "paid"
-    session.add(reorder)
-    session.commit()
-    return {"message": "Payment successful", "payment": payment}
+class message(BaseModel):
+    msg:str
 
 
-class AgentChatRequest(BaseModel):
-    agent: str
-    messages: List[Dict[str, str]]
+@function_tool
+def get_low_stock_items_tool():
+    """Return all items where quantity is below reorder level."""
+    from schema import engine
+    from sqlmodel import Session, select
 
-@app.post("/agent/chat")
-def chat_with_agent(req: AgentChatRequest, session: Session = Depends(get_session)):
-    system_prompt = (
-        "You are an AI agent that helps manage inventory and finance tasks. "
-        "Decide when to call appropriate backend functions to perform actions."
-    )
+    with Session(engine) as session:
+        items = session.exec(select(InventoryItem)).all()
 
-    messages = [{"role": "system", "content": system_prompt}] + req.messages
+        low_stock = [
+            {
+                "id": i.id,
+                "name": i.name,
+                "quantity": i.quantity,
+                "reorder_level": i.reorder_level
+            }
+            for i in items if i.quantity < i.reorder_level
+        ]
 
-    functions = [
-        {
-            "name": "get_low_stock_items",
-            "description": "Retrieve all items below their reorder level",
-            "parameters": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "create_reorder",
-            "description": "Create a reorder for an item",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_id": {"type": "integer"},
-                    "quantity": {"type": "integer"},
-                },
-                "required": ["item_id", "quantity"],
-            },
-        },
-        {
-            "name": "approve_reorder",
-            "description": "Approve or reject a reorder request",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reorder_id": {"type": "integer"},
-                    "approve": {"type": "boolean"},
-                },
-                "required": ["reorder_id", "approve"],
-            },
-        },
-        {
-            "name": "create_payment",
-            "description": "Process payment for an approved reorder",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "reorder_id": {"type": "integer"},
-                },
-                "required": ["reorder_id"],
-            },
-        },
-    ]
+    return low_stock
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        functions=functions,
-        function_call="auto",
-    )
+@function_tool
+def create_reorder_tool(data: CreateReorderInput) -> dict:
+    """Create a reorder entry for an item."""
+    from schema import engine
+    from sqlmodel import Session, select
 
-    message = response["choices"][0]["message"]
+    with Session(engine) as session:
 
-    if "function_call" in message:
-        fname = message["function_call"]["name"]
-        args = json.loads(message["function_call"].get("arguments", "{}"))
+        item = session.get(InventoryItem, data.item_id)
+        if not item:
+            return {"error": "Item not found"}
 
-        if fname == "get_low_stock_items":
-            return get_low_stock_items(session)
-        elif fname == "create_reorder":
-            return create_reorder(session, **args)
-        elif fname == "approve_reorder":
-            return approve_reorder(session, **args)
-        elif fname == "create_payment":
-            return create_payment(session, **args)
+        total_cost = data.quantity * item.price_per_unit
+
+        reorder = Reorder(
+            item_id=data.item_id,
+            quantity_requested=data.quantity,
+            unit_price=item.price_per_unit,
+            total_cost=total_cost,
+            requested_by=data.requested_by,
+        )
+
+        session.add(reorder)
+        session.commit()
+        session.refresh(reorder)
+
+        return {"message": "Reorder created", "reorder": reorder}
+
+
+
+def approve_reorder_tool(data: ApproveReorderInput):
+    """Approve or reject a reorder."""
+    from schema import engine
+    from sqlmodel import Session
+
+    with Session(engine) as session:
+
+        reorder = session.get(Reorder, data.reorder_id)
+        if not reorder:
+            return {"error": "Reorder not found"}
+
+        if data.approve:
+            reorder.status = "approved"
+            reorder.approved_by = data.approver
+            reorder.approved_at = datetime.utcnow()
         else:
-            return {"error": f"Unknown function: {fname}"}
+            reorder.status = "rejected"
 
-    return {"response": message["content"]}
+        session.commit()
+
+        return {"message": f"Reorder {reorder.status}"}
+
+
+
+def create_payment_tool(data: CreatePaymentInput):
+    """Create payment for an approved reorder."""
+    from schema import engine
+    from sqlmodel import Session, select
+
+    with Session(engine) as session:
+
+        reorder = session.get(Reorder, data.reorder_id)
+        if not reorder or reorder.status != "approved":
+            return {"error": "Reorder must be approved first"}
+
+        payment = Payment(
+            reorder_id=data.reorder_id,
+            amount=reorder.total_cost,
+            status="paid",
+            paid_at=datetime.utcnow(),
+        )
+        session.add(payment)
+
+        # Update budget
+        budget = session.exec(select(Budget).limit(1)).first()
+        if budget:
+            budget.spent_amount += reorder.total_cost
+            session.add(budget)
+
+        reorder.status = "paid"
+        session.add(reorder)
+
+        session.commit()
+
+        return {"message": "Payment successful", "payment": payment}
+    
+@function_tool
+def approve_and_pay_reorder(data: ApproveReorderInput):
+    approve_result = approve_reorder_tool(data)
+    if "error" in approve_result:
+        return approve_result
+    
+    # Automatically create payment
+    payment_result = create_payment_tool(CreatePaymentInput(reorder_id=data.reorder_id))
+    
+    return {
+        "approve_result": approve_result,
+        "payment_result": payment_result
+    }
+
+class FinanceOutput(BaseModel):
+    approved: List[int]
+    paid: List[int]
+    total_spent: float
+    summary: str
+
+    
+finance_agent = Agent(
+    name="finance agent",
+    instructions=
+f"""{RECOMMENDED_PROMPT_PREFIX}
+You are the Finance Agent.
+You receive workflow tasks from the manager agent.
+Rules:
+1. If given a reorder that needs approval, **always call `approve_reorder_tool`**.
+2. If given an approved reorder that requires payment, **always call `create_payment_tool`**.
+3. Do not perform any action without using the tools.
+4. Return only the tool's output.
+"""
+,
+    tools=[approve_and_pay_reorder
+        ], 
+    
+    handoff_description="Finance agent which handle finance queries like approve reorder or create payments",
+
+    output_type=FinanceOutput,
+    model='gpt-4o')
+
+class InventoryOutput(BaseModel):
+    low_stock_count: int
+    reorders_created: List[int]
+    total_cost: float
+    summary: str
+
+inventory_agent = Agent(
+    name="Inventory Agent",
+    instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
+You are the Inventory Agent.You can check low stock items and create re-order requests
+""",
+    tools=[get_low_stock_items_tool,
+        create_reorder_tool,
+        ], 
+
+    handoff_description="inventory agent which can check low stock items and create proper reorder requests",
+
+    model='gpt-4o',
+
+    output_type=InventoryOutput,
+ 
+)
+
+
+manager_agent = Agent(name="Manager agent",
+    instructions=f"""{RECOMMENDED_PROMPT_PREFIX}
+You are the Manager Agent.
+You receive events from the workflow, such as inventory placing a reorder.
+Your responsibilities:
+1. If the event indicates a reorder was placed, immediately call the `finance_tool` to handle it.
+   - If the reorder needs approval, call `approve_reorder_tool`.
+   - If the reorder is approved and ready for payment, call `create_payment_tool`.
+2. Always use the tools; never skip or attempt to answer yourself.
+3. After calling the tool, return its output.
+4. Do not wait for any user query; act based on the workflow event.
+
+Always use the inventory tool first then called the finance tool 
+
+
+""",
+    tools=[
+        inventory_agent.as_tool(
+            tool_name="inventory_tool",
+            tool_description="do inventory management work"
+        ),
+        finance_agent.as_tool(
+            tool_name="finance_tool",
+            tool_description="do the finance work"
+        ),]
+        ,
+    model='gpt-4o',
+    model_settings=ModelSettings(parallel_tool_calls=False)
+    )
+
+@app.get("/inventory", response_model=List[InventoryItem])
+def get_inventory(session: Session = Depends(get_session)):
+    items = session.exec(select(InventoryItem)).all()
+    return items
+
+# Endpoint to get all reorders
+@app.get("/reorders", response_model=List[Reorder])
+def get_reorders(session: Session = Depends(get_session)):
+    reorders = session.exec(select(Reorder)).all()
+    return reorders
+
+# Endpoint to get all payments
+@app.get("/payments", response_model=List[Payment])
+def get_payments(session: Session = Depends(get_session)):
+    payments = session.exec(select(Payment)).all()
+    return payments
+
+# Endpoint to get all budgets
+@app.get("/budgets", response_model=List[Budget])
+def get_budgets(session: Session = Depends(get_session)):
+    budgets = session.exec(select(Budget)).all()
+    return budgets
+
+@app.get("/agent/chat/stream")
+async def stream_agent(msg: str, session: Session = Depends(get_session)):
+    async def event_generator():
+        result = Runner.run_streamed(manager_agent, msg)
+        
+        async for event in result.stream_events():
+            output = None
+            
+            if event.type == "raw_response_event":
+                continue            
+            elif event.type == "agent_updated_stream_event":
+                output = {
+                    "type": "agent_updated",
+                    "new_agent": event.new_agent.name
+                }
+            
+            elif event.type == "run_item_stream_event":
+                if event.item.type == "tool_call_item":
+                    output = {
+                        "type": "tool_call",
+                        "input": event.item.to_input_item()["name"]
+                    }
+                elif event.item.type == "tool_call_output_item":
+                    # Convert string to dict if needed
+                    if isinstance(event.item.output, str):
+                        try:
+                            output_data = json.loads(event.item.output)
+                        except json.JSONDecodeError:
+                            output_data = event.item.output
+                    else:
+                        output_data = event.item.output
+
+                    output = {
+                        "type": "tool_output",
+                        "output": output_data
+                    }
+                elif event.item.type == "message_output_item":
+                    output = {
+                        "type": "message_output",
+                        "message": ItemHelpers.text_message_output(event.item)
+                    }
+            
+            if output:
+                # SSE format: 'data: <json>\n\n'
+                yield f"data: {json.dumps(output)}\n\n"
+            
+            await asyncio.sleep(0.01)  # prevent blocking
+    
+        # Send final output
+        yield f"data: {json.dumps({'type': 'final_output', 'output': result.final_output})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+# @app.post("/agent/chat")
+# async def main(req: message, session: Session = Depends(get_session)):
+
+#     result = Runner.run_streamed(manager_agent, req.msg,)
+#     print("=== Run starting ===")
+
+#     async for event in result.stream_events():
+#         # We'll ignore the raw responses event deltas
+#         if event.type == "raw_response_event":
+#             continue
+#         # When the agent updates, print that
+#         elif event.type == "agent_updated_stream_event":
+#             print(f"Agent updated: {event.new_agent.name}")
+#             continue
+#         # When items are generated, print them
+#         elif event.type == "run_item_stream_event":
+#             if event.item.type == "tool_call_item":
+#                 print("-- Tool was called")
+#                 tool_input = event.item.to_input_item()
+#                 print(f"Tool name: {tool_input}")
+#             elif event.item.type == "tool_call_output_item":
+#                 print(f"-- Tool output: {event.item.output}")
+#             elif event.item.type == "message_output_item":
+#                 print(f"-- Message output:\n {ItemHelpers.text_message_output(event.item)}")
+#             else:
+#                 pass  # Ignore other event types
+
+#     print("=== Run complete ===")
+#     return result.final_output
+
+
+
+
+
+    
